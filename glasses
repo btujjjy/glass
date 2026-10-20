@@ -1,0 +1,435 @@
+name: Build Liquid Glass APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/example/liquidglass
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "LiquidGlass"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.example.liquidglass'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.example.liquidglass"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Liquid Glass"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".MainActivity$OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="floating glass overlay" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/liquidglass/MainActivity.java <<'EOF'
+          package com.example.liquidglass;
+
+          import android.animation.ValueAnimator;
+          import android.app.Activity;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.LinearGradient;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.PixelFormat;
+          import android.graphics.RectF;
+          import android.graphics.Shader;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.IBinder;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.view.animation.LinearInterpolator;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+
+              private TextView status;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  buildUi();
+                  requestNotificationPermission();
+              }
+
+              private void buildUi() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER);
+                  root.setPadding(dp(28), dp(28), dp(28), dp(28));
+                  root.setBackgroundColor(Color.rgb(10, 10, 16));
+
+                  TextView title = new TextView(this);
+                  title.setText("液态玻璃悬浮栏");
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(24);
+                  title.setGravity(Gravity.CENTER);
+
+                  TextView desc = new TextView(this);
+                  desc.setText("无需 root。开启悬浮窗权限后，底部会显示一层液态玻璃。\n它只是覆盖层，不会修改抖音本身。");
+                  desc.setTextColor(Color.rgb(170, 170, 185));
+                  desc.setTextSize(13);
+                  desc.setGravity(Gravity.CENTER);
+                  desc.setPadding(0, dp(12), 0, dp(24));
+
+                  Button start = new Button(this);
+                  start.setText("开启液态玻璃");
+                  start.setOnClickListener(v -> {
+                      if (!Settings.canDrawOverlays(this)) {
+                          startActivity(new Intent(
+                                  Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                  Uri.parse("package:" + getPackageName())
+                          ));
+                          status.setText("请先允许“显示在其他应用上层”");
+                      } else {
+                          startForegroundService(new Intent(this, OverlayService.class));
+                          status.setText("已开启");
+                      }
+                  });
+
+                  Button stop = new Button(this);
+                  stop.setText("关闭");
+                  stop.setOnClickListener(v -> {
+                      stopService(new Intent(this, OverlayService.class));
+                      status.setText("已关闭");
+                  });
+
+                  status = new TextView(this);
+                  status.setText("等待开启");
+                  status.setTextColor(Color.rgb(120, 200, 255));
+                  status.setTextSize(13);
+                  status.setGravity(Gravity.CENTER);
+                  status.setPadding(0, dp(18), 0, 0);
+
+                  root.addView(title);
+                  root.addView(desc);
+                  root.addView(start, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(52)));
+                  root.addView(stop, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(52)));
+                  root.addView(status);
+
+                  setContentView(root);
+              }
+
+              private void requestNotificationPermission() {
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                          checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                                  != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
+                  }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (status != null) {
+                      if (Settings.canDrawOverlays(this)) {
+                          status.setText("悬浮窗权限已允许");
+                      } else {
+                          status.setText("等待悬浮窗权限");
+                      }
+                  }
+              }
+
+              private int dp(int v) {
+                  return Math.round(v * getResources().getDisplayMetrics().density);
+              }
+
+              public static class OverlayService extends Service {
+
+                  private static final String CHANNEL_ID = "liquid_glass";
+                  private WindowManager wm;
+                  private LiquidGlassView view;
+
+                  @Override
+                  public void onCreate() {
+                      super.onCreate();
+                      startForeground(1001, buildNotification());
+                      wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                      addOverlay();
+                  }
+
+                  private Notification buildNotification() {
+                      NotificationChannel channel = new NotificationChannel(
+                              CHANNEL_ID, "液态玻璃", NotificationManager.IMPORTANCE_LOW);
+                      NotificationManager nm = getSystemService(NotificationManager.class);
+                      nm.createNotificationChannel(channel);
+
+                      Notification.Builder b = new Notification.Builder(this, CHANNEL_ID);
+                      b.setSmallIcon(android.R.drawable.ic_menu_view)
+                              .setContentTitle("液态玻璃已开启")
+                              .setContentText("底部悬浮栏正在显示")
+                              .setOngoing(true);
+                      return b.build();
+                  }
+
+                  private void addOverlay() {
+                      if (view != null) return;
+
+                      view = new LiquidGlassView(this);
+                      int width = getResources().getDisplayMetrics().widthPixels - dp(24);
+
+                      WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                              width,
+                              dp(88),
+                              WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                              WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                      | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                      | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                      | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                              PixelFormat.TRANSLUCENT);
+
+                      params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                      params.y = dp(14);
+
+                      if (Build.VERSION.SDK_INT >= 31) {
+                          try {
+                              params.setBlurBehindRadius(40);
+                              params.flags |= WindowManager.LayoutParams.FLAG_BLUR_BEHIND;
+                          } catch (Throwable ignored) {
+                          }
+                      }
+
+                      try {
+                          wm.addView(view, params);
+                      } catch (Exception e) {
+                          stopSelf();
+                      }
+                  }
+
+                  @Override
+                  public int onStartCommand(Intent intent, int flags, int startId) {
+                      return START_STICKY;
+                  }
+
+                  @Override
+                  public void onDestroy() {
+                      if (view != null && wm != null) {
+                          try {
+                              wm.removeView(view);
+                          } catch (Exception ignored) {
+                          }
+                          view = null;
+                      }
+                      super.onDestroy();
+                  }
+
+                  @Override
+                  public IBinder onBind(Intent intent) {
+                      return null;
+                  }
+
+                  private int dp(int v) {
+                      return Math.round(v * getResources().getDisplayMetrics().density);
+                  }
+              }
+
+              public static class LiquidGlassView extends View {
+
+                  private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint shinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint topPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final RectF rect = new RectF();
+                  private final Path clip = new Path();
+                  private final float radius;
+                  private float phase = 0f;
+                  private final ValueAnimator animator;
+
+                  public LiquidGlassView(Context context) {
+                      super(context);
+                      radius = dp(28);
+                      setLayerType(LAYER_TYPE_SOFTWARE, null);
+
+                      animator = ValueAnimator.ofFloat(0f, 1f);
+                      animator.setDuration(6500);
+                      animator.setRepeatCount(ValueAnimator.INFINITE);
+                      animator.setInterpolator(new LinearInterpolator());
+                      animator.addUpdateListener(a -> {
+                          phase = (float) a.getAnimatedValue();
+                          invalidate();
+                      });
+                  }
+
+                  @Override
+                  protected void onAttachedToWindow() {
+                      super.onAttachedToWindow();
+                      if (!animator.isStarted()) animator.start();
+                  }
+
+                  @Override
+                  protected void onDetachedFromWindow() {
+                      animator.cancel();
+                      super.onDetachedFromWindow();
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas canvas) {
+                      super.onDraw(canvas);
+
+                      float w = getWidth();
+                      float h = getHeight();
+                      if (w <= 0 || h <= 0) return;
+
+                      rect.set(0, 0, w, h);
+                      clip.reset();
+                      clip.addRoundRect(rect, radius, radius, Path.Direction.CW);
+
+                      canvas.save();
+                      canvas.clipPath(clip);
+
+                      LinearGradient fill = new LinearGradient(
+                              0, 0, w, h,
+                              new int[]{0x55FFFFFF, 0x14FFFFFF, 0x33FFFFFF},
+                              new float[]{0f, 0.45f, 1f},
+                              Shader.TileMode.CLAMP);
+                      fillPaint.setShader(fill);
+                      canvas.drawRect(rect, fillPaint);
+
+                      float shineX = -w + (w * 2f) * phase;
+                      LinearGradient shine = new LinearGradient(
+                              shineX, 0, shineX + w * 0.65f, h,
+                              new int[]{0x00FFFFFF, 0x99FFFFFF, 0x00FFFFFF},
+                              new float[]{0f, 0.5f, 1f},
+                              Shader.TileMode.CLAMP);
+                      shinePaint.setShader(shine);
+                      canvas.drawRect(rect, shinePaint);
+
+                      canvas.restore();
+
+                      borderPaint.setStyle(Paint.Style.STROKE);
+                      borderPaint.setStrokeWidth(dp(1));
+                      borderPaint.setColor(0x88FFFFFF);
+                      canvas.drawRoundRect(rect, radius, radius, borderPaint);
+
+                      topPaint.setStyle(Paint.Style.STROKE);
+                      topPaint.setStrokeWidth(dp(1));
+                      topPaint.setShader(new LinearGradient(
+                              0, 0, w, 0,
+                              new int[]{0x00FFFFFF, 0xCCFFFFFF, 0x00FFFFFF},
+                              null,
+                              Shader.TileMode.CLAMP));
+                      canvas.drawLine(radius, dp(1), w - radius, dp(1), topPaint);
+                  }
+
+                  private int dp(int v) {
+                      return Math.round(v * getResources().getDisplayMetrics().density);
+                  }
+              }
+          }
+          EOF
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build APK
+        run: gradle assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: liquid-glass-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
